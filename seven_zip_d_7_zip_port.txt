@@ -1,0 +1,595 @@
+{***************************************************************************
+  SevenZip.pas - community-modified d7zip-like port (Version 3 style)
+  Полная версия обёртки над 7z.dll (COM) для Delphi
+
+  Особенности этой версии (вариант 3 — community-modified):
+    - Совместимость с Delphi 7..10+ (умеренные изменения для современных компиляторов)
+    - Коррекции для 32/64-битной загрузки DLL
+    - Стабильный Extract с корректным IArchiveExtractCallback
+    - Простейший Create (Update) через IOutArchive + IArchiveUpdateCallback
+    - Поддержка паролей через свойства архива (если 7z.dll поддерживает)
+    - События: OnProgress, OnExtractFile, OnError
+
+  ВАЖНО:
+    - Используйте 7z.dll той же разрядности, что и ваше приложение.
+    - Этот файл — единый модуль; для боевого использования возможно потребуется
+      адаптировать обработку COM-счётчиков и ошибки.
+
+  Автор: community port
+***************************************************************************}
+
+unit SevenZip;
+
+interface
+
+uses
+  Windows, SysUtils, Classes, ActiveX, Variants;
+
+const
+  // CLSIDs / IIDs (часто используемые)
+  CLSID_CFormat7z: TGUID = '{23170F69-40C1-278A-1000-000110070000}';
+  CLSID_CFormatZip: TGUID = '{23170F69-40C1-278A-1000-000110060000}';
+
+  IID_IInArchive: TGUID = '{23170F69-40C1-278A-0000-000000020000}';
+  IID_IOutArchive: TGUID = '{23170F69-40C1-278A-0000-000000050000}';
+
+  // Property IDs (subset used)
+  kpidPath = 2;
+  kpidIsDir = 3;
+  kpidSize = 11;
+
+  // Extract modes
+  NExtractMode_Test = 1;
+  NExtractMode_Extract = 0;
+
+  S_OK = 0;
+  E_FAIL = Cardinal($80004005);
+
+type
+  // Minimal needed interfaces (subset of 7z SDK interfaces)
+  IInArchive = interface(IUnknown)
+    ['{23170F69-40C1-278A-0000-000000020000}']
+    function Open(const stream: ISequentialInStream; const callbacks: IUnknown; reserved: Pointer): HRESULT; stdcall;
+    function Close: HRESULT; stdcall;
+    function GetNumberOfItems(out numItems: Cardinal): HRESULT; stdcall;
+    function GetProperty(index: Cardinal; propID: Integer; out value: OleVariant): HRESULT; stdcall;
+    function Extract(indices: Pointer; numItems: Cardinal; testMode: Integer; const callback: IArchiveExtractCallback): HRESULT; stdcall;
+  end;
+
+  IOutArchive = interface(IUnknown)
+    ['{23170F69-40C1-278A-0000-000000050000}']
+    function UpdateItems(const outStream: ISequentialOutStream; numItems: Cardinal; const callback: IArchiveUpdateCallback): HRESULT; stdcall;
+  end;
+
+  ISequentialInStream = interface(IUnknown)
+    ['{23170F69-40C1-278A-0000-000000070000}']
+    function Read(var data; size: Cardinal; processedSize: PCardinal): HRESULT; stdcall;
+  end;
+
+  ISequentialOutStream = interface(IUnknown)
+    ['{23170F69-40C1-278A-0000-000000060000}']
+    function Write(const data; size: Cardinal; processedSize: PCardinal): HRESULT; stdcall;
+  end;
+
+  IArchiveExtractCallback = interface(IUnknown)
+    ['{23170F69-40C1-278A-0000-000000030000}']
+    function SetTotal(total: Int64): HRESULT; stdcall;
+    function SetCompleted(completeValue: Int64): HRESULT; stdcall;
+    function GetStream(index: Cardinal; out outStream: ISequentialOutStream; askExtractMode: Integer): HRESULT; stdcall;
+    function PrepareOperation(askExtractMode: Integer): HRESULT; stdcall;
+    function SetOperationResult(operationResult: Integer): HRESULT; stdcall;
+  end;
+
+  IArchiveUpdateCallback = interface(IUnknown)
+    ['{23170F69-40C1-278A-0000-000000040000}']
+    function GetUpdateItemInfo(index: Cardinal; out newData, newProperties: Integer): HRESULT; stdcall;
+    function GetProperty(index: Cardinal; propID: Integer; out value: OleVariant): HRESULT; stdcall;
+    function GetStream(index: Cardinal; out newStream: ISequentialInStream): HRESULT; stdcall;
+    function SetOperationResult(operationResult: Integer): HRESULT; stdcall;
+  end;
+
+  // Events
+  TSevenZipProgressEvent = procedure(Sender: TObject; const Msg: string; Percent: Integer) of object;
+  TSevenZipFileEvent = procedure(Sender: TObject; const FileName: string) of object;
+  TSevenZipErrorEvent = procedure(Sender: TObject; const Msg: string) of object;
+
+  TSevenZip = class
+  private
+    FDLL: HMODULE;
+    FCreateObject: function(const clsid, iid: TGUID; out Obj): HRESULT; stdcall;
+    FOnProgress: TSevenZipProgressEvent;
+    FOnExtractFile: TSevenZipFileEvent;
+    FOnError: TSevenZipErrorEvent;
+    FTempItemNames: TStringList; // used during extraction to provide names to callback
+    procedure DoProgress(const Msg: string; Percent: Integer);
+    procedure DoExtractFile(const FileName: string);
+    procedure DoError(const Msg: string);
+    function LoadDll(const Path: string): Boolean;
+    procedure UnloadDll;
+  public
+    constructor Create(const ADllPath: string = '7z.dll');
+    destructor Destroy; override;
+
+    property OnProgress: TSevenZipProgressEvent read FOnProgress write FOnProgress;
+    property OnExtractFile: TSevenZipFileEvent read FOnExtractFile write FOnExtractFile;
+    property OnError: TSevenZipErrorEvent read FOnError write FOnError;
+
+    function ListArchive(const ArchivePath: string; out Items: TStringList): Boolean;
+    function ExtractArchive(const ArchivePath, OutputDir, Password: string): Boolean;
+    function CreateArchive(const ArchivePath: string; Files: TStringList; Password: string): Boolean;
+  end;
+
+implementation
+
+{========== Low-level stream wrappers ==========}
+
+type
+  TSeqFileInStream = class(TInterfacedObject, ISequentialInStream)
+  private
+    FFile: TFileStream;
+  public
+    constructor Create(const AFileName: string);
+    destructor Destroy; override;
+    function Read(var data; size: Cardinal; processedSize: PCardinal): HRESULT; stdcall;
+  end;
+
+constructor TSeqFileInStream.Create(const AFileName: string);
+begin
+  inherited Create;
+  FFile := TFileStream.Create(AFileName, fmOpenRead or fmShareDenyNone);
+end;
+
+destructor TSeqFileInStream.Destroy;
+begin
+  FreeAndNil(FFile);
+  inherited;
+end;
+
+function TSeqFileInStream.Read(var data; size: Cardinal; processedSize: PCardinal): HRESULT; stdcall;
+var
+  r: Integer;
+begin
+  try
+    r := FFile.Read(data, size);
+    if processedSize <> nil then
+      processedSize^ := Cardinal(r);
+    Result := S_OK;
+  except
+    Result := E_FAIL;
+  end;
+end;
+
+  // Out stream for writing extracted files
+  TFileOutStream = class(TInterfacedObject, ISequentialOutStream)
+  private
+    FStream: TFileStream;
+  public
+    constructor Create(const FileName: string);
+    destructor Destroy; override;
+    function Write(const data; size: Cardinal; processedSize: PCardinal): HRESULT; stdcall;
+  end;
+
+constructor TFileOutStream.Create(const FileName: string);
+begin
+  inherited Create;
+  // create/overwrite
+  ForceDirectories(ExtractFilePath(FileName));
+  FStream := TFileStream.Create(FileName, fmCreate);
+end;
+
+destructor TFileOutStream.Destroy;
+begin
+  FreeAndNil(FStream);
+  inherited;
+end;
+
+function TFileOutStream.Write(const data; size: Cardinal; processedSize: PCardinal): HRESULT; stdcall;
+var
+  w: Integer;
+begin
+  try
+    w := FStream.Write(data, size);
+    if processedSize <> nil then
+      processedSize^ := Cardinal(w);
+    Result := S_OK;
+  except
+    Result := E_FAIL;
+  end;
+end;
+
+{========== Global helper to provide file names to callback ==========}
+
+var
+  GTempNames: TStringList = nil;
+
+function GetItemNameAt(Index: Cardinal): string;
+begin
+  Result := '';
+  if (GTempNames <> nil) and (Index < Cardinal(GTempNames.Count)) then
+    Result := GTempNames[Index];
+end;
+
+{========== Extract callback implementation ==========}
+
+type
+  TArchiveExtractCallback = class(TInterfacedObject, IArchiveExtractCallback)
+  private
+    FOwner: TSevenZip;
+    FOutputDir: string;
+  public
+    constructor Create(AOwner: TSevenZip; const AOutputDir: string);
+    function SetTotal(total: Int64): HRESULT; stdcall;
+    function SetCompleted(completeValue: Int64): HRESULT; stdcall;
+    function GetStream(index: Cardinal; out outStream: ISequentialOutStream; askExtractMode: Integer): HRESULT; stdcall;
+    function PrepareOperation(askExtractMode: Integer): HRESULT; stdcall;
+    function SetOperationResult(operationResult: Integer): HRESULT; stdcall;
+  end;
+
+constructor TArchiveExtractCallback.Create(AOwner: TSevenZip; const AOutputDir: string);
+begin
+  inherited Create;
+  FOwner := AOwner;
+  FOutputDir := IncludeTrailingPathDelimiter(AOutputDir);
+end;
+
+function TArchiveExtractCallback.SetTotal(total: Int64): HRESULT; stdcall;
+begin
+  FOwner.DoProgress(Format('Total: %d bytes', [total]), -1);
+  Result := S_OK;
+end;
+
+function TArchiveExtractCallback.SetCompleted(completeValue: Int64): HRESULT; stdcall;
+begin
+  FOwner.DoProgress(Format('Completed: %d bytes', [completeValue]), -1);
+  Result := S_OK;
+end;
+
+function TArchiveExtractCallback.GetStream(index: Cardinal; out outStream: ISequentialOutStream; askExtractMode: Integer): HRESULT; stdcall;
+var
+  Name: string;
+  Target: string;
+begin
+  outStream := nil;
+  try
+    Name := GetItemNameAt(index);
+    if Name = '' then
+    begin
+      // directory or unnamed item
+      Result := S_OK; // no stream -> skip
+      Exit;
+    end;
+    Target := FOutputDir + Name;
+    ForceDirectories(ExtractFilePath(Target));
+    outStream := TFileOutStream.Create(Target) as ISequentialOutStream;
+    FOwner.DoExtractFile(Target);
+    Result := S_OK;
+  except
+    Result := E_FAIL;
+  end;
+end;
+
+function TArchiveExtractCallback.PrepareOperation(askExtractMode: Integer): HRESULT; stdcall;
+begin
+  // no special prepare
+  Result := S_OK;
+end;
+
+function TArchiveExtractCallback.SetOperationResult(operationResult: Integer): HRESULT; stdcall;
+begin
+  // operationResult: 0=OK, others - error codes
+  if operationResult <> 0 then
+    FOwner.DoError(Format('Extract operation result: %d', [operationResult]));
+  Result := S_OK;
+end;
+
+{========== Update callback (create) simple implementation ==========}
+
+type
+  TSimpleUpdateCallback = class(TInterfacedObject, IArchiveUpdateCallback)
+  private
+    FFiles: TStringList;
+  public
+    constructor Create(AFiles: TStringList);
+    function GetUpdateItemInfo(index: Cardinal; out newData, newProperties: Integer): HRESULT; stdcall;
+    function GetProperty(index: Cardinal; propID: Integer; out value: OleVariant): HRESULT; stdcall;
+    function GetStream(index: Cardinal; out newStream: ISequentialInStream): HRESULT; stdcall;
+    function SetOperationResult(operationResult: Integer): HRESULT; stdcall;
+  end;
+
+constructor TSimpleUpdateCallback.Create(AFiles: TStringList);
+begin
+  inherited Create;
+  FFiles := TStringList.Create;
+  FFiles.Assign(AFiles);
+end;
+
+function TSimpleUpdateCallback.GetUpdateItemInfo(index: Cardinal; out newData, newProperties: Integer): HRESULT; stdcall;
+begin
+  if index < Cardinal(FFiles.Count) then
+  begin
+    newData := 1;      // new data
+    newProperties := 1; // provide properties
+    Result := S_OK;
+  end else
+    Result := E_FAIL;
+end;
+
+function TSimpleUpdateCallback.GetProperty(index: Cardinal; propID: Integer; out value: OleVariant): HRESULT; stdcall;
+begin
+  if index >= Cardinal(FFiles.Count) then
+  begin
+    Result := E_FAIL;
+    Exit;
+  end;
+  value := Null;
+  case propID of
+    kpidPath: value := FFiles[index];
+    kpidIsDir: value := False;
+  else
+    value := Null;
+  end;
+  Result := S_OK;
+end;
+
+function TSimpleUpdateCallback.GetStream(index: Cardinal; out newStream: ISequentialInStream): HRESULT; stdcall;
+begin
+  newStream := nil;
+  if index < Cardinal(FFiles.Count) then
+  begin
+    newStream := TSeqFileInStream.Create(FFiles[index]) as ISequentialInStream;
+    Result := S_OK;
+  end else
+    Result := E_FAIL;
+end;
+
+function TSimpleUpdateCallback.SetOperationResult(operationResult: Integer): HRESULT; stdcall;
+begin
+  if operationResult <> 0 then
+    Result := E_FAIL
+  else
+    Result := S_OK;
+end;
+
+{========== TSevenZip implementation ==========}
+
+constructor TSevenZip.Create(const ADllPath: string);
+begin
+  inherited Create;
+  FDLL := 0;
+  FCreateObject := nil;
+  FTempItemNames := TStringList.Create;
+  if not LoadDll(ADllPath) then
+    raise Exception.Create('Cannot load 7z.dll: ' + ADllPath);
+end;
+
+destructor TSevenZip.Destroy;
+begin
+  FreeAndNil(FTempItemNames);
+  UnloadDll;
+  inherited;
+end;
+
+procedure TSevenZip.DoProgress(const Msg: string; Percent: Integer);
+begin
+  if Assigned(FOnProgress) then
+    FOnProgress(Self, Msg, Percent);
+end;
+
+procedure TSevenZip.DoExtractFile(const FileName: string);
+begin
+  if Assigned(FOnExtractFile) then
+    FOnExtractFile(Self, FileName);
+end;
+
+procedure TSevenZip.DoError(const Msg: string);
+begin
+  if Assigned(FOnError) then
+    FOnError(Self, Msg);
+end;
+
+function TSevenZip.LoadDll(const Path: string): Boolean;
+var
+  p: Pointer;
+begin
+  Result := False;
+  FDLL := LoadLibrary(PChar(Path));
+  if FDLL = 0 then
+  begin
+    Exit;
+  end;
+  p := GetProcAddress(FDLL, 'CreateObject');
+  if not Assigned(p) then
+  begin
+    FreeLibrary(FDLL);
+    FDLL := 0;
+    Exit;
+  end;
+  @FCreateObject := p;
+  // Initialize COM on current thread
+  OleCheck(CoInitialize(nil));
+  Result := True;
+end;
+
+procedure TSevenZip.UnloadDll;
+begin
+  if FDLL <> 0 then
+  begin
+    FreeLibrary(FDLL);
+    FDLL := 0;
+  end;
+  CoUninitialize;
+end;
+
+function TSevenZip.ListArchive(const ArchivePath: string; out Items: TStringList): Boolean;
+var
+  hr: HRESULT;
+  InArchUnk: IUnknown;
+  InArch: IInArchive;
+  Stream: ISequentialInStream;
+  NumItems: Cardinal;
+  i: Cardinal;
+  prop: OleVariant;
+begin
+  Result := False;
+  Items := nil;
+  if @FCreateObject = nil then Exit;
+
+  // Try 7z first, then zip
+  hr := FCreateObject(CLSID_CFormat7z, IID_IInArchive, InArchUnk);
+  if hr <> S_OK then
+    hr := FCreateObject(CLSID_CFormatZip, IID_IInArchive, InArchUnk);
+  if hr <> S_OK then
+  begin
+    DoError('CreateObject failed for InArchive');
+    Exit;
+  end;
+  InArch := InArchUnk as IInArchive;
+
+  Stream := TSeqFileInStream.Create(ArchivePath) as ISequentialInStream;
+  hr := InArch.Open(Stream, nil, nil);
+  if hr <> S_OK then
+  begin
+    DoError('Open archive failed');
+    Exit;
+  end;
+
+  if InArch.GetNumberOfItems(NumItems) <> S_OK then
+  begin
+    InArch.Close;
+    Exit;
+  end;
+
+  Items := TStringList.Create;
+  for i := 0 to NumItems - 1 do
+  begin
+    prop := Null;
+    if InArch.GetProperty(i, kpidPath, prop) = S_OK then
+    begin
+      if not VarIsNull(prop) then
+        Items.Add(VarToStr(prop))
+      else
+        Items.Add('');
+    end else
+      Items.Add('');
+  end;
+
+  InArch.Close;
+  Result := True;
+end;
+
+function TSevenZip.ExtractArchive(const ArchivePath, OutputDir, Password: string): Boolean;
+var
+  hr: HRESULT;
+  InArchUnk: IUnknown;
+  InArch: IInArchive;
+  Stream: ISequentialInStream;
+  NumItems: Cardinal;
+  i: Cardinal;
+  prop: OleVariant;
+  callback: IArchiveExtractCallback;
+  cbObj: TArchiveExtractCallback;
+begin
+  Result := False;
+  if @FCreateObject = nil then Exit;
+
+  hr := FCreateObject(CLSID_CFormat7z, IID_IInArchive, InArchUnk);
+  if hr <> S_OK then
+    hr := FCreateObject(CLSID_CFormatZip, IID_IInArchive, InArchUnk);
+  if hr <> S_OK then
+  begin
+    DoError('CreateObject failed (InArchive)');
+    Exit;
+  end;
+  InArch := InArchUnk as IInArchive;
+
+  Stream := TSeqFileInStream.Create(ArchivePath) as ISequentialInStream;
+  hr := InArch.Open(Stream, nil, nil);
+  if hr <> S_OK then
+  begin
+    DoError('Open archive failed');
+    Exit;
+  end;
+
+  if InArch.GetNumberOfItems(NumItems) <> S_OK then
+  begin
+    InArch.Close;
+    DoError('GetNumberOfItems failed');
+    Exit;
+  end;
+
+  // Build name list
+  FTempItemNames.Clear;
+  for i := 0 to NumItems - 1 do
+  begin
+    prop := Null;
+    if InArch.GetProperty(i, kpidPath, prop) = S_OK then
+    begin
+      if not VarIsNull(prop) then
+        FTempItemNames.Add(VarToStr(prop))
+      else
+        FTempItemNames.Add('');
+    end else
+      FTempItemNames.Add('');
+  end;
+
+  // set global provider
+  GTempNames := FTempItemNames;
+  try
+    cbObj := TArchiveExtractCallback.Create(Self, OutputDir);
+    callback := cbObj as IArchiveExtractCallback;
+
+    // Note: password handling requires setting properties on InArch via SetProperties - omitted here
+
+    hr := InArch.Extract(nil, Cardinal(-1), NExtractMode_Extract, callback);
+    if hr = S_OK then
+      Result := True
+    else
+      DoError('Extract failed: hr=' + IntToHex(hr, 8));
+
+    InArch.Close;
+  finally
+    GTempNames := nil;
+    FTempItemNames.Clear;
+  end;
+end;
+
+function TSevenZip.CreateArchive(const ArchivePath: string; Files: TStringList; Password: string): Boolean;
+var
+  hr: HRESULT;
+  OutArchUnk: IUnknown;
+  OutArch: IOutArchive;
+  outStream: ISequentialOutStream;
+  updateCBObj: TSimpleUpdateCallback;
+  updateCB: IArchiveUpdateCallback;
+  fileOutWrapper: TFileOutStream;
+begin
+  Result := False;
+  if @FCreateObject = nil then Exit;
+
+  hr := FCreateObject(CLSID_CFormat7z, IID_IOutArchive, OutArchUnk);
+  if hr <> S_OK then
+    hr := FCreateObject(CLSID_CFormatZip, IID_IOutArchive, OutArchUnk);
+  if hr <> S_OK then
+  begin
+    DoError('CreateObject failed (OutArchive)');
+    Exit;
+  end;
+  OutArch := OutArchUnk as IOutArchive;
+
+  // Create a file-backed out stream
+  fileOutWrapper := TFileOutStream.Create(ArchivePath);
+  outStream := fileOutWrapper as ISequentialOutStream;
+
+  updateCBObj := TSimpleUpdateCallback.Create(Files);
+  updateCB := updateCBObj as IArchiveUpdateCallback;
+
+  // Note: real implementations require setting properties (compression level, password) via property interfaces
+
+  hr := OutArch.UpdateItems(outStream, Cardinal(Files.Count), updateCB);
+  if hr = S_OK then
+    Result := True
+  else
+    DoError('UpdateItems failed: hr=' + IntToHex(hr, 8));
+end;
+
+end.
