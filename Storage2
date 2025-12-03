@@ -1,4 +1,3 @@
-
 # services/storage.py
 
 from __future__ import annotations
@@ -43,16 +42,19 @@ class _FileStreamer:
 
 class Storage:
     """
-    Production STREAM Storage:
-    - AES-256-GCM streaming encrypt
-    - AES-256-GCM streaming decrypt → plaintext written into tmp file
-    - reading encrypted/plain in streaming mode
+    STREAMING Storage with AES-256-GCM encryption.
+
+    Особенности:
+    - STREAM шифрование больших файлов
+    - STREAM дешифровка в любую директорию
+    - SHA256 имена файлов
+    - Хранение зашифрованных файлов
     """
 
-    CHUNK = 4 * 1024 * 1024  # 4 MB chunk
+    CHUNK = 4 * 1024 * 1024  # 4 MB
 
     # ---------------------------------------------------------
-    # BASIC
+    # БАЗОВЫЕ МЕТОДЫ
     # ---------------------------------------------------------
 
     def exists(self, abs_path: str | Path) -> bool:
@@ -68,87 +70,57 @@ class Storage:
         return Path(abs_path).stat().st_size
 
     # ---------------------------------------------------------
-    # SAVE (STREAMING)
+    # SAVE (STREAM)
     # ---------------------------------------------------------
 
     def save(self, tmp_path: str | Path, dst_abs_path: str | Path, key: bytes | None) -> Path:
         """
-        Streaming save: stream read tmp → stream write dst.
-        Supports:
-        - plain (copy)
-        - AES-GCM streaming encryption
+        Streaming save: tmp → dst.
+        - key=None      → plain copy
+        - key=32 bytes  → AES-256-GCM streaming encryption
         """
-
         tmp = Path(tmp_path)
         dst = Path(dst_abs_path)
         dst.parent.mkdir(parents=True, exist_ok=True)
 
-        # plain
         if key is None:
             shutil.copy2(tmp, dst)
             return dst
 
         if len(key) != 32:
-            raise ValueError("AES-GCM key must be 32 bytes")
+            raise ValueError("AES-GCM data key must be 32 bytes")
 
         self._encrypt_stream(tmp, dst, key)
         return dst
 
     # ---------------------------------------------------------
-    # OPEN STREAM (decrypted)
+    # OPEN STREAM (decrypt → tmp → stream)
     # ---------------------------------------------------------
 
     def open(self, abs_path: str | Path, key: bytes | None):
-        """
-        Возвращает file-like stream для FileResponse.
-        Если файл encrypted:
-            - создается tmp_plain
-            - ciphertext → decrypt(stream) → tmp_plain
-            - stream tmp_plain клиенту
-        """
         return _FileStreamer(self.open_stream(abs_path, key))
 
     def open_stream(self, abs_path: str | Path, key: bytes | None) -> Iterator[bytes]:
-        """
-        Для encrypted файлов:
-            ciphertext → streaming decrypt → tmp_plain
-            отдаём tmp_plain чанками
-        """
-
         p = Path(abs_path)
         if not p.exists():
             raise FileNotFoundError(p)
 
-        # plain read → go streaming directly
+        # plain file
         if key is None:
             with p.open("rb") as f:
                 while chunk := f.read(self.CHUNK):
                     yield chunk
             return
 
-        if len(key) != 32:
-            raise ValueError("AES-GCM key must be 32 bytes")
+        # encrypted → decrypt to tmp → stream tmp
+        tmp_plain = self.decrypt_to_dir(abs_path, tempfile.mkdtemp(), key)
 
-        # -----------------------
-        # 1. streaming decrypt into TMP PLAIN
-        # -----------------------
-        tmp_plain = self._decrypt_to_tempfile(p, key)
-
-        # -----------------------
-        # 2. stream tmp_plain
-        # -----------------------
-        with tmp_plain.open("rb") as f:
+        with Path(tmp_plain).open("rb") as f:
             while chunk := f.read(self.CHUNK):
                 yield chunk
 
-        # remove tmp after use
-        try:
-            tmp_plain.unlink()
-        except:
-            pass
-
     # ---------------------------------------------------------
-    # SAVE TO TREE HASHED (SHA256)
+    # SAVE TO TREE (SHA256)
     # ---------------------------------------------------------
 
     def save_to_tree_hashed(
@@ -162,10 +134,10 @@ class Storage:
 
         tmp_path = Path(tmp_path)
 
-        # calculate SHA256
+        # SHA256 digest
         sha256 = hashlib.sha256()
         with tmp_path.open("rb") as f:
-            while (chunk := f.read(1024 * 1024)):
+            while chunk := f.read(1024 * 1024):
                 sha256.update(chunk)
 
         digest = sha256.hexdigest()
@@ -181,53 +153,30 @@ class Storage:
         return self.save(tmp_path, dst, key)
 
     # ---------------------------------------------------------
-    # DECRYPT TO DIRECTORY
+    # DECRYPT STREAM (into directory)
     # ---------------------------------------------------------
 
-    def decrypt_to_dir(self, abs_path: str | Path, output_dir: str | Path, key: bytes):
+    def decrypt_to_dir(self, abs_path: str | Path, output_dir: str | Path, key: bytes) -> Path:
         """
-        ciphertext → stream decrypt → plain file in output_dir
+        encrypted_file → stream decrypt → plain_file
         """
         if key is None:
-            raise ValueError("decrypt_to_dir requires a key")
+            raise ValueError("decrypt_to_dir requires AES key")
 
         if len(key) != 32:
-            raise ValueError("AES-GCM key must be 32 bytes")
+            raise ValueError("AES-GCM data key must be 32 bytes")
 
         src = Path(abs_path)
         if not src.exists():
             raise FileNotFoundError(src)
 
-        out = Path(output_dir)
-        out.mkdir(parents=True, exist_ok=True)
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        dst = out / src.name
+        dst = out_dir / src.name
 
         self._decrypt_stream(src, dst, key)
         return dst
-
-    # ---------------------------------------------------------
-    # RE-ENCRYPT STREAMING
-    # ---------------------------------------------------------
-
-    def reencrypt(self, abs_path: str | Path, old_key: bytes, new_key: bytes):
-        """
-        streaming decrypt → streaming encrypt
-        """
-        if len(old_key) != 32 or len(new_key) != 32:
-            raise ValueError("AES-GCM keys must be 32 bytes")
-
-        src = Path(abs_path)
-        if not src.exists():
-            raise FileNotFoundError(src)
-
-        # decrypt to tmp
-        tmp_plain = self._decrypt_to_tempfile(src, old_key)
-
-        # encrypt back with new key
-        self._encrypt_stream(tmp_plain, src, new_key)
-
-        tmp_plain.unlink()
 
     # ---------------------------------------------------------
     # INTERNAL STREAMING AES-GCM
@@ -236,65 +185,48 @@ class Storage:
     def _encrypt_stream(self, src: Path, dst: Path, key: bytes):
         nonce = secrets.token_bytes(12)
 
-        cipher = Cipher(
-            algorithms.AES(key),
-            modes.GCM(nonce),
-        )
-
+        cipher = Cipher(algorithms.AES(key), modes.GCM(nonce))
         encryptor = cipher.encryptor()
 
         with src.open("rb") as fin, dst.open("wb") as fout:
-            # write nonce
             fout.write(nonce)
 
             while chunk := fin.read(self.CHUNK):
-                encrypted = encryptor.update(chunk)
-                if encrypted:
-                    fout.write(encrypted)
+                data = encryptor.update(chunk)
+                if data:
+                    fout.write(data)
 
-            # finalize
             tail = encryptor.finalize()
             if tail:
                 fout.write(tail)
 
-            # write GCM tag (16 bytes)
             fout.write(encryptor.tag)
 
     def _decrypt_stream(self, src: Path, dst: Path, key: bytes):
         with src.open("rb") as fin:
             nonce = fin.read(12)
-            tag = fin.seek(-16, os.SEEK_END)
+
+            fin.seek(-16, os.SEEK_END)
+            tag = fin.read(16)
+
+            total = src.stat().st_size - 12 - 16
             fin.seek(12)
 
-            # ciphertext length minus tag
-            total = src.stat().st_size - 12 - 16
-
-            cipher = Cipher(
-                algorithms.AES(key),
-                modes.GCM(nonce),
-            )
+            cipher = Cipher(algorithms.AES(key), modes.GCM(nonce, tag))
             decryptor = cipher.decryptor()
 
             with dst.open("wb") as fout:
                 remaining = total
                 while remaining > 0:
                     chunk = fin.read(min(self.CHUNK, remaining))
-                    remaining -= len(chunk)
                     if not chunk:
                         break
+                    remaining -= len(chunk)
+
                     plain = decryptor.update(chunk)
                     if plain:
                         fout.write(plain)
 
-                # attach tag
-                decryptor._ctx.update_tag(fin.read(16))
-
                 tail = decryptor.finalize()
                 if tail:
                     fout.write(tail)
-
-    def _decrypt_to_tempfile(self, src: Path, key: bytes) -> Path:
-        tmp = Path(tempfile.mktemp(prefix="plain_"))
-
-        self._decrypt_stream(src, tmp, key)
-        return tmp
