@@ -1,0 +1,225 @@
+# storage.py
+
+from __future__ import annotations
+
+import secrets
+from pathlib import Path
+from typing import Iterator
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+
+
+class _IteratorReader:
+    def __init__(self, iterator: Iterator[bytes]):
+        self.iterator = iterator
+        self.buffer = b""
+
+    def read(self, size=-1):
+        if size < 0:
+            return b"".join(self.iterator)
+
+        chunks = []
+        remain = size
+
+        while remain > 0:
+            if not self.buffer:
+                try:
+                    self.buffer = next(self.iterator)
+                except StopIteration:
+                    break
+
+            take = min(remain, len(self.buffer))
+            chunks.append(self.buffer[:take])
+            self.buffer = self.buffer[take:]
+            remain -= take
+
+        return b"".join(chunks)
+
+
+class Storage:
+    CHUNK = 4 * 1024 * 1024
+
+    def __init__(self, encrypted_suffix=".enc", decrypted_suffix=".bin"):
+        self.encrypted_suffix = encrypted_suffix
+        self.decrypted_suffix = decrypted_suffix
+        self.backend = default_backend()
+
+    # ---------------------------------------------------------
+    # PATH TRANSFORMS
+    # ---------------------------------------------------------
+
+    def to_enc_path(self, path: str | Path) -> Path:
+        p = Path(path)
+        if not p.name.endswith(self.encrypted_suffix):
+            return p.with_name(p.name + self.encrypted_suffix)
+        return p
+
+    def to_dec_path(self, path: str | Path) -> Path:
+        p = Path(path)
+        if p.name.endswith(self.encrypted_suffix):
+            return p.with_suffix("").with_suffix(self.decrypted_suffix)
+        return p.with_suffix(self.decrypted_suffix)
+
+    # ---------------------------------------------------------
+    # BASIC
+    # ---------------------------------------------------------
+
+    def exists(self, abs_path: str | Path) -> bool:
+        return Path(abs_path).exists()
+
+    def delete(self, abs_path: str | Path):
+        try:
+            Path(abs_path).unlink()
+        except FileNotFoundError:
+            pass
+
+    def size(self, abs_path: str | Path) -> int:
+        return Path(abs_path).stat().st_size
+
+    # ---------------------------------------------------------
+    # SAVE (tmp → encrypted)
+    # ---------------------------------------------------------
+
+    def save(self, tmp_path: str | Path, dst_abs_path: str | Path, key: bytes) -> Path:
+        if len(key) != 32:
+            raise ValueError("AES key must be 32 bytes")
+
+        tmp = Path(tmp_path)
+        dst = self.to_enc_path(dst_abs_path)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+
+        self._encrypt_file(tmp, dst, key)
+        return dst
+
+    # ---------------------------------------------------------
+    # STREAM READ
+    # ---------------------------------------------------------
+
+    def open(self, abs_path: str | Path, key: bytes):
+        return _IteratorReader(self.open_stream(abs_path, key))
+
+    def open_stream(self, abs_path: str | Path, key: bytes) -> Iterator[bytes]:
+        if len(key) != 32:
+            raise ValueError("AES key must be 32 bytes")
+
+        p = Path(abs_path)
+        if not p.exists():
+            raise FileNotFoundError(p)
+
+        # unencrypted file
+        if not p.name.endswith(self.encrypted_suffix):
+            with p.open("rb") as f:
+                while chunk := f.read(self.CHUNK):
+                    yield chunk
+            return
+
+        # encrypted file
+        with p.open("rb") as f:
+            iv = f.read(16)
+            if len(iv) != 16:
+                raise ValueError("Corrupted encrypted file: missing IV")
+
+            decryptor = Cipher(
+                algorithms.AES(key),
+                modes.CTR(iv),
+                backend=self.backend
+            ).decryptor()
+
+            while chunk := f.read(self.CHUNK):
+                yield decryptor.update(chunk)
+
+            tail = decryptor.finalize()
+            if tail:
+                yield tail
+
+    # ---------------------------------------------------------
+    # DECRYPT TO NEW FILE (same dir)
+    # ---------------------------------------------------------
+
+    def decrypt_to_new_path(self, abs_enc_path: str | Path, key: bytes) -> Path:
+        src = Path(abs_enc_path)
+        dst = self.to_dec_path(src)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+
+        with dst.open("wb") as out:
+            for chunk in self.open_stream(src, key):
+                out.write(chunk)
+
+        return dst
+
+    # ---------------------------------------------------------
+    # 🔥 NEW METHOD: DECRYPT TO SPECIFIED DIRECTORY
+    # ---------------------------------------------------------
+
+    def decrypt_to_dir(self, abs_enc_path: str | Path, output_dir: str | Path, key: bytes) -> Path:
+        """
+        Дешифровать файл в указанную директорию.
+
+        abs_enc_path = /mnt/disk1/user/file123.enc
+        output_dir   = /tmp/extract/
+        → результат:  /tmp/extract/file123.bin
+        """
+        if len(key) != 32:
+            raise ValueError("AES key must be 32 bytes")
+
+        src = Path(abs_enc_path)
+        if not src.exists():
+            raise FileNotFoundError(src)
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # создаём имя: file.enc → file.bin
+        dst_name = self.to_dec_path(src.name)
+        dst = output_dir / dst_name
+
+        with dst.open("wb") as out:
+            for chunk in self.open_stream(src, key):
+                out.write(chunk)
+
+        return dst
+
+    # ---------------------------------------------------------
+    # RE-ENCRYPT (old_key → new_key)
+    # ---------------------------------------------------------
+
+    def reencrypt(self, abs_enc_path: str | Path, old_key: bytes, new_key: bytes):
+        if len(old_key) != 32 or len(new_key) != 32:
+            raise ValueError("AES key must be 32 bytes")
+
+        src = Path(abs_enc_path)
+        if not src.exists():
+            return
+
+        tmp = src.with_suffix(src.suffix + ".tmp")
+
+        # decrypt → tmp
+        with tmp.open("wb") as out:
+            for b in self.open_stream(src, old_key):
+                out.write(b)
+
+        # encrypt new
+        self._encrypt_file(tmp, src, new_key)
+        tmp.unlink()
+
+    # ---------------------------------------------------------
+    # INTERNAL ENCRYPT
+    # ---------------------------------------------------------
+
+    def _encrypt_file(self, src: Path, dst: Path, key: bytes):
+        iv = secrets.token_bytes(16)
+        cipher = Cipher(
+            algorithms.AES(key),
+            modes.CTR(iv),
+            backend=self.backend
+        )
+        encryptor = cipher.encryptor()
+
+        with src.open("rb") as fin, dst.open("wb") as out:
+            out.write(iv)
+            while chunk := fin.read(self.CHUNK):
+                out.write(encryptor.update(chunk))
+            tail = encryptor.finalize()
+            if tail:
+                out.write(tail)
