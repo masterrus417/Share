@@ -1,0 +1,45 @@
+# services/key_manager.py
+
+import os
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+
+class KeyManager:
+    """
+    Envelope Encryption:
+
+    - Генерирует per-file ключи (AES-256)
+    - Шифрует их master-key'ем (AES-256-GCM)
+    - Хранит в БД только encrypted_key
+    - Master-key хранится ТОЛЬКО в settings (ENV)
+    """
+
+    def __init__(self, master_key: bytes):
+        if len(master_key) not in (16, 24, 32):
+            raise ValueError("Master key must be 16, 24, or 32 bytes")
+
+        self.master_key = master_key
+        self.aes = AESGCM(master_key)
+
+    @staticmethod
+    def generate_data_key() -> bytes:
+        """Пер-файловый AES-256 ключ (32 байта)."""
+        return os.urandom(32)
+
+    def wrap_key(self, data_key: bytes) -> bytes:
+        """Шифрует per-file ключ. Возвращает: nonce + ciphertext+tag."""
+        if len(data_key) != 32:
+            raise ValueError("Data key must be 32 bytes")
+
+        nonce = os.urandom(12)
+        ct_tag = self.aes.encrypt(nonce, data_key, None)
+        return nonce + ct_tag
+
+    def unwrap_key(self, wrapped: bytes) -> bytes:
+        """Расшифровывает per-file ключ."""
+        if len(wrapped) < 12 + 16:
+            raise ValueError("wrapped key too short")
+
+        nonce = wrapped[:12]
+        ct_tag = wrapped[12:]
+        return self.aes.decrypt(nonce, ct_tag, None)
