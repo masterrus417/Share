@@ -1,0 +1,246 @@
+unit fms;
+
+interface
+
+uses
+  System.SysUtils, System.Classes, System.JSON,
+  Curl.Lib, Curl.Easy, Curl.Form, Curl.Slist;
+
+type
+  TProgressCallback = reference to procedure(Current, Total: Int64);
+
+  TFMSClient = class
+  private
+    FBaseUrl: string;
+    FBearer: string;
+
+    function CurlGet(const Url: string; OnProgress: TProgressCallback = nil): string;
+    function CurlPostMultipart(const Url: string;
+                               const Fields: array of string;
+                               const Files: TArray<string>;
+                               OnProgress: TProgressCallback = nil): string;
+    function CurlDownload(const Url, SaveTo: string;
+                          OnProgress: TProgressCallback = nil): Boolean;
+  public
+    constructor Create(const ABaseUrl: string; const ABearer: string = '');
+
+    function GetVersion: string;
+
+    function UploadFiles(
+      const Files: TArray<string>;
+      const PoolName, ExpiresAt: string;
+      Retention: Integer;
+      OnProgress: TProgressCallback = nil
+    ): string;
+
+    function DownloadFile(
+      const FileId, SaveTo: string;
+      OnProgress: TProgressCallback = nil
+    ): Boolean;
+  end;
+
+implementation
+
+{ ===================== PROGRESS CALLBACK ===================== }
+
+type
+  PProgressRec = ^TProgressRec;
+  TProgressRec = record
+    Callback: TProgressCallback;
+  end;
+
+function ProgressCallback(userdata: Pointer;
+  dltotal, dlnow, ultotal, ulnow: curl_off_t): Integer; cdecl;
+var
+  R: PProgressRec;
+begin
+  R := PProgressRec(userdata);
+
+  if Assigned(R^.Callback) then
+  begin
+    if ultotal > 0 then
+      R^.Callback(ulnow, ultotal)
+    else if dltotal > 0 then
+      R^.Callback(dlnow, dltotal);
+  end;
+
+  Result := 0; // Continue
+end;
+
+procedure SetupProgress(curl: ICurl; OnProgress: TProgressCallback; var Rec: TProgressRec);
+begin
+  if Assigned(OnProgress) then
+  begin
+    Rec.Callback := OnProgress;
+    curl.SetOpt(CURLOPT_NOPROGRESS, 0);
+    curl.SetOpt(CURLOPT_XFERINFOFUNCTION, @ProgressCallback);
+    curl.SetOpt(CURLOPT_XFERINFODATA, @Rec);
+  end;
+end;
+
+{ ====================== WRITE CALLBACK ======================== }
+
+function WriteCallback(ptr: Pointer; size, nmemb: size_t; userdata: Pointer): size_t; cdecl;
+var
+  Stream: TStream;
+begin
+  Stream := TStream(userdata);
+  Stream.Write(ptr^, size * nmemb);
+  Result := size * nmemb;
+end;
+
+{ ========================= CONSTRUCTOR ======================== }
+
+constructor TFMSClient.Create(const ABaseUrl, ABearer: string);
+begin
+  FBaseUrl := ABaseUrl.TrimRight(['/']);
+  FBearer := ABearer;
+end;
+
+{ ========================== CURL GET ========================== }
+
+function TFMSClient.CurlGet(const Url: string; OnProgress: TProgressCallback): string;
+var
+  curl: ICurl;
+  Mem: TMemoryStream;
+  headers: ICurlSList;
+  Rec: TProgressRec;
+begin
+  curl := TCurl.Create;
+  Mem := TMemoryStream.Create;
+  try
+    curl.SetOpt(CURLOPT_URL, Url);
+    curl.SetOpt(CURLOPT_WRITEFUNCTION, @WriteCallback);
+    curl.SetOpt(CURLOPT_WRITEDATA, Mem);
+    curl.SetOpt(CURLOPT_HTTPAUTH, CURLAUTH_ANY);
+
+    FillChar(Rec, SizeOf(Rec), 0);
+    SetupProgress(curl, OnProgress, Rec);
+
+    if FBearer <> '' then
+    begin
+      headers := TCurlSList.Create;
+      headers.Append('Authorization: Bearer ' + FBearer);
+      curl.SetOpt(CURLOPT_HTTPHEADER, headers);
+    end;
+
+    if curl.Perform <> CURLE_OK then
+      raise Exception.Create('GET failed: ' + curl.ErrorBuffer);
+
+    SetString(Result, PAnsiChar(Mem.Memory), Mem.Size);
+  finally
+    Mem.Free;
+  end;
+end;
+
+{ ==================== CURL POST MULTIPART ====================== }
+
+function TFMSClient.CurlPostMultipart(const Url: string;
+  const Fields: array of string; const Files: TArray<string>;
+  OnProgress: TProgressCallback): string;
+var
+  curl: ICurl;
+  form, last: ICurlHttpPost;
+  Mem: TMemoryStream;
+  i: Integer;
+  Rec: TProgressRec;
+begin
+  curl := TCurl.Create;
+  form := nil;
+  last := nil;
+  Mem := TMemoryStream.Create;
+
+  try
+    // add form fields
+    for i := 0 to High(Fields) do
+    begin
+      curl.FormAdd(form, last)
+        .SetName(Fields[i].Split(['='])[0])
+        .SetContents(Fields[i].Split(['='])[1])
+        .Add;
+    end;
+
+    // add files
+    for i := 0 to High(Files) do
+    begin
+      curl.FormAdd(form, last)
+        .SetName('files')
+        .SetFile(Files[i])
+        .Add;
+    end;
+
+    curl.SetOpt(CURLOPT_URL, Url);
+    curl.SetOpt(CURLOPT_HTTPPOST, form);
+    curl.SetOpt(CURLOPT_WRITEFUNCTION, @WriteCallback);
+    curl.SetOpt(CURLOPT_WRITEDATA, Mem);
+    curl.SetOpt(CURLOPT_HTTPAUTH, CURLAUTH_ANY);
+
+    FillChar(Rec, SizeOf(Rec), 0);
+    SetupProgress(curl, OnProgress, Rec);
+
+    if curl.Perform <> CURLE_OK then
+      raise Exception.Create('Upload failed: ' + curl.ErrorBuffer);
+
+    SetString(Result, PAnsiChar(Mem.Memory), Mem.Size);
+
+  finally
+    Mem.Free;
+  end;
+end;
+
+{ ========================= CURL DOWNLOAD ======================== }
+
+function TFMSClient.CurlDownload(const Url, SaveTo: string;
+  OnProgress: TProgressCallback): Boolean;
+var
+  curl: ICurl;
+  FS: TFileStream;
+  Rec: TProgressRec;
+begin
+  curl := TCurl.Create;
+  FS := TFileStream.Create(SaveTo, fmCreate);
+  try
+    curl.SetOpt(CURLOPT_URL, Url);
+    curl.SetOpt(CURLOPT_WRITEFUNCTION, @WriteCallback);
+    curl.SetOpt(CURLOPT_WRITEDATA, FS);
+    curl.SetOpt(CURLOPT_HTTPAUTH, CURLAUTH_ANY);
+
+    FillChar(Rec, SizeOf(Rec), 0);
+    SetupProgress(curl, OnProgress, Rec);
+
+    Result := curl.Perform = CURLE_OK;
+  finally
+    FS.Free;
+  end;
+end;
+
+{ ============================= API ============================= }
+
+function TFMSClient.GetVersion: string;
+begin
+  Result := CurlGet(FBaseUrl + '/version');
+end;
+
+function TFMSClient.UploadFiles(const Files: TArray<string>;
+  const PoolName, ExpiresAt: string; Retention: Integer;
+  OnProgress: TProgressCallback): string;
+begin
+  Result := CurlPostMultipart(
+    FBaseUrl + '/files',
+    [
+      'pool_name=' + PoolName,
+      'expires_at=' + ExpiresAt,
+      'file_retention_period=' + IntToStr(Retention)
+    ],
+    Files,
+    OnProgress
+  );
+end;
+
+function TFMSClient.DownloadFile(const FileId, SaveTo: string;
+  OnProgress: TProgressCallback): Boolean;
+begin
+  Result := CurlDownload(FBaseUrl + '/files/' + FileId, SaveTo, OnProgress);
+end;
+
+end.
