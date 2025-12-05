@@ -1,0 +1,209 @@
+unit fms;
+
+interface
+
+uses
+  System.SysUtils, System.Classes,
+  Curl.Lib, Curl.Interfaces, Curl.Easy, Curl.Form, Curl.Slist;
+
+type
+  TProgressCallback = procedure(Sent, Total: Int64) of object;
+
+  TFMSClient = class
+  private
+    FBaseUrl: string;
+    FBearer: string;
+    FUseKerberos: Boolean;
+  public
+    constructor Create(
+      const ABaseUrl: string;
+      const ABearerToken: string = '';
+      AUseKerberos: Boolean = False
+    );
+
+    function GetVersion: string;
+
+    function UploadFiles(
+      const Files: TArray<string>;
+      const PoolName, ExpiresAt: string;
+      Retention: Integer;
+      OnProgress: TProgressCallback = nil
+    ): string;
+
+    function DownloadFile(
+      const FileID, SaveTo: string;
+      OnProgress: TProgressCallback = nil
+    ): Boolean;
+
+    property BaseUrl: string read FBaseUrl;
+    property BearerToken: string read FBearer;
+    property UseKerberos: Boolean read FUseKerberos;
+  end;
+
+implementation
+
+{ ================= PROGRESS CALLBACK ================= }
+
+type
+  PProgRec = ^TProgRec;
+  TProgRec = record
+    Callback: TProgressCallback;
+  end;
+
+function CurlProgress(UserData: Pointer; dltotal, dlnow, ultotal, ulnow: curl_off_t): Integer; cdecl;
+var
+  R: PProgRec;
+begin
+  R := PProgRec(UserData);
+
+  if Assigned(R^.Callback) then
+  begin
+    if ultotal > 0 then
+      R^.Callback(ulnow, ultotal)
+    else if dltotal > 0 then
+      R^.Callback(dlnow, dltotal);
+  end;
+
+  Result := 0;
+end;
+
+{ ================= HELPERS ================= }
+
+procedure ApplyKerberosIfNeeded(Curl: ICurl; Enabled: Boolean);
+begin
+  if Enabled then
+  begin
+    Curl.SetOpt(CURLOPT_HTTPAUTH, CURLAUTH_NEGOTIATE);
+    Curl.SetOpt(CURLOPT_USERPWD, PAnsiChar(AnsiString(':'))); // empty creds → use Windows ticket
+  end;
+end;
+
+procedure ApplyBearerIfNeeded(Curl: ICurl; const Token: string);
+var
+  Headers: ICurlSList;
+begin
+  if Token <> '' then
+  begin
+    Headers := CurlGetSList();
+    Headers.Add('Authorization: Bearer ' + RawByteString(Token));
+    Curl.SetCustomHeaders(Headers);
+  end;
+end;
+
+{ ================= TFMSClient ================= }
+
+constructor TFMSClient.Create(
+  const ABaseUrl, ABearerToken: string; AUseKerberos: Boolean);
+begin
+  FBaseUrl := ABaseUrl;
+  FBearer := ABearerToken;
+  FUseKerberos := AUseKerberos;
+end;
+
+function TFMSClient.GetVersion: string;
+var
+  Curl: ICurl;
+  Stream: TStringStream;
+begin
+  Result := '';
+
+  Curl := TCurl.Create;
+  Stream := TStringStream.Create('', TEncoding.UTF8);
+  try
+    Curl.SetURL(PAnsiChar(AnsiString(FBaseUrl + '/version')));
+
+    ApplyKerberosIfNeeded(Curl, FUseKerberos);
+    ApplyBearerIfNeeded(Curl, FBearer);
+
+    Curl.SetWriteStream(Stream);
+    Curl.Perform;
+
+    Result := Stream.DataString;
+  finally
+    Stream.Free;
+  end;
+end;
+
+function TFMSClient.UploadFiles(const Files: TArray<string>;
+  const PoolName, ExpiresAt: string; Retention: Integer;
+  OnProgress: TProgressCallback): string;
+var
+  Curl: ICurl;
+  Form: ICurlForm;
+  Stream: TStringStream;
+  F: string;
+  Prog: TProgRec;
+begin
+  Result := '';
+
+  Curl := TCurl.Create;
+  Form := CurlGetForm();
+
+  { текстовые поля }
+  Form.Add('pool_name', PoolName);
+  Form.Add('expires_at', ExpiresAt);
+  Form.Add('file_retention_period', IntToStr(Retention));
+
+  { файлы }
+  for F in Files do
+    Form.AddFile('files', F, 'application/octet-stream');
+
+  ApplyKerberosIfNeeded(Curl, FUseKerberos);
+  ApplyBearerIfNeeded(Curl, FBearer);
+
+  { прогресс }
+  FillChar(Prog, SizeOf(Prog), 0);
+  Prog.Callback := OnProgress;
+
+  Curl.SetOpt(CURLOPT_NOPROGRESS, 0);
+  Curl.SetOpt(CURLOPT_XFERINFOFUNCTION, @CurlProgress);
+  Curl.SetOpt(CURLOPT_XFERINFODATA, @Prog);
+
+  { URL + form }
+  Curl.SetURL(PAnsiChar(AnsiString(FBaseUrl + '/files')));
+  Curl.SetPostForm(Form);
+
+  Stream := TStringStream.Create('', TEncoding.UTF8);
+  try
+    Curl.SetWriteStream(Stream);
+    Curl.Perform;
+    Result := Stream.DataString;
+  finally
+    Stream.Free;
+  end;
+end;
+
+function TFMSClient.DownloadFile(const FileID, SaveTo: string;
+  OnProgress: TProgressCallback): Boolean;
+var
+  Curl: ICurl;
+  FS: TFileStream;
+  Prog: TProgRec;
+begin
+  Result := False;
+
+  Curl := TCurl.Create;
+  FS := TFileStream.Create(SaveTo, fmCreate);
+  try
+    Curl.SetURL(PAnsiChar(AnsiString(FBaseUrl + '/files/' + FileID)));
+
+    ApplyKerberosIfNeeded(Curl, FUseKerberos);
+    ApplyBearerIfNeeded(Curl, FBearer);
+
+    FillChar(Prog, SizeOf(Prog), 0);
+    Prog.Callback := OnProgress;
+
+    Curl.SetOpt(CURLOPT_NOPROGRESS, 0);
+    Curl.SetOpt(CURLOPT_XFERINFOFUNCTION, @CurlProgress);
+    Curl.SetOpt(CURLOPT_XFERINFODATA, @Prog);
+
+    Curl.SetWriteStream(FS);
+    Curl.Perform;
+
+    Result := True;
+  finally
+    FS.Free;
+  end;
+end;
+
+end.
