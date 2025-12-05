@@ -1,0 +1,168 @@
+unit fms;
+
+interface
+
+uses
+  System.SysUtils, System.Classes,
+  REST.Client, REST.Types;
+
+type
+  TProgressCallback = reference to procedure(Current, Total: Int64);
+
+  TFMSClient = class
+  private
+    FBaseUrl: string;
+    FBearer: string;
+
+    function CreateClient: TRESTClient;
+  public
+    constructor Create(const ABaseUrl: string); overload;
+    constructor Create(const ABaseUrl, ABearerToken: string); overload;
+
+    function GetVersion: string;
+
+    function UploadFiles(const Files: TArray<string>;
+                         const PoolName, ExpiresAt: string;
+                         Retention: Integer): string;
+
+    function DownloadFile(const FileId: string; const SaveTo: string): Boolean;
+
+    property BaseUrl: string read FBaseUrl write FBaseUrl;
+    property BearerToken: string read FBearer write FBearer;
+  end;
+
+implementation
+
+constructor TFMSClient.Create(const ABaseUrl: string);
+begin
+  Create(ABaseUrl, '');
+end;
+
+constructor TFMSClient.Create(const ABaseUrl, ABearerToken: string);
+begin
+  FBaseUrl := ABaseUrl.TrimRight(['/']);
+  FBearer := ABearerToken;
+end;
+
+function TFMSClient.CreateClient: TRESTClient;
+begin
+  Result := TRESTClient.Create(FBaseUrl);
+  Result.Accept := 'application/json';
+
+  if FBearer <> '' then
+    Result.AddParameter('Authorization', 'Bearer ' + FBearer, pkHTTPHEADER, [poDoNotEncode]);
+end;
+
+//
+// ----------------------- GET VERSION -----------------------
+//
+function TFMSClient.GetVersion: string;
+var
+  Client: TRESTClient;
+  Req: TRESTRequest;
+  Resp: TRESTResponse;
+begin
+  Client := CreateClient;
+  Req := TRESTRequest.Create(nil);
+  Resp := TRESTResponse.Create(nil);
+  try
+    Req.Client := Client;
+    Req.Response := Resp;
+
+    Req.Resource := 'version';
+    Req.Method := rmGET;
+
+    Req.Execute;
+
+    Result := Resp.Content;
+  finally
+    Client.Free;
+    Req.Free;
+    Resp.Free;
+  end;
+end;
+
+//
+// ---------------------- MULTIPART UPLOAD ----------------------
+//
+function TFMSClient.UploadFiles(const Files: TArray<string>;
+                                const PoolName, ExpiresAt: string;
+                                Retention: Integer): string;
+var
+  Client: TRESTClient;
+  Req: TRESTRequest;
+  Resp: TRESTResponse;
+  i: Integer;
+begin
+  Client := CreateClient;
+  Req := TRESTRequest.Create(nil);
+  Resp := TRESTResponse.Create(nil);
+  try
+    Req.Client := Client;
+    Req.Response := Resp;
+
+    Req.Resource := 'files';
+    Req.Method := rmPOST;
+
+    // multipart
+    Req.AddParameter('pool_name', PoolName, pkGETorPOST);
+    Req.AddParameter('expires_at', ExpiresAt, pkGETorPOST);
+    Req.AddParameter('file_retention_period', IntToStr(Retention), pkGETorPOST);
+
+    for i := 0 to High(Files) do
+      Req.AddFile('files', Files[i], ExtractFileName(Files[i]));
+
+    Req.Execute;
+
+    Result := Resp.Content;
+  finally
+    Client.Free;
+    Req.Free;
+    Resp.Free;
+  end;
+end;
+
+//
+// ----------------------- FILE DOWNLOAD -----------------------
+//
+function TFMSClient.DownloadFile(const FileId: string; const SaveTo: string): Boolean;
+var
+  Client: TRESTClient;
+  Req: TRESTRequest;
+  Resp: TRESTResponse;
+  FS: TFileStream;
+begin
+  Result := False;
+
+  Client := CreateClient;
+  Req := TRESTRequest.Create(nil);
+  Resp := TRESTResponse.Create(nil);
+  try
+    Req.Client := Client;
+    Req.Response := Resp;
+
+    Req.Resource := 'files/' + FileId;
+    Req.Method := rmGET;
+
+    Req.Execute;
+
+    if Resp.StatusCode = 200 then
+    begin
+      FS := TFileStream.Create(SaveTo, fmCreate);
+      try
+        FS.WriteBuffer(Resp.RawBytes[0], Length(Resp.RawBytes));
+      finally
+        FS.Free;
+      end;
+
+      Result := True;
+    end;
+
+  finally
+    Client.Free;
+    Req.Free;
+    Resp.Free;
+  end;
+end;
+
+end.
