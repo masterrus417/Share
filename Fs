@@ -1,0 +1,149 @@
+uses
+  Winapi.Windows, Winapi.WinHTTP,
+  System.SysUtils, System.Classes;
+
+type
+  TProgressCallback = reference to procedure(SentBytes, TotalBytes: Int64);
+
+const
+  BOUNDARY = '----MyBoundary123456789';
+
+function UploadFileWinHTTP(
+  const Url: string;
+  const FilePath: string;
+  const PoolName: string;
+  const ExpiresAt: string;
+  const Retention: Integer;
+  const Progress: TProgressCallback
+): string;
+var
+  Session, Connect, Request: HINTERNET;
+  Server, Resource: string;
+  Port: INTERNET_PORT;
+  Flags: DWORD;
+  FileStream: TFileStream;
+  Header, Footer: string;
+  Buffer: array[0..16383] of Byte; // 16 KB chunks
+  ReadBytes: DWORD;
+  SentTotal: Int64;
+  UrlComp: URL_COMPONENTS;
+  Resp: TStringStream;
+  Buf: array[0..4095] of Byte;
+begin
+  { ---------------- Разбор URL ---------------- }
+  ZeroMemory(@UrlComp, SizeOf(UrlComp));
+  UrlComp.dwStructSize := SizeOf(UrlComp);
+  UrlComp.dwHostNameLength := DWORD(-1);
+  UrlComp.dwUrlPathLength := DWORD(-1);
+
+  if not WinHttpCrackUrl(PWideChar(Url), Length(Url), 0, UrlComp) then
+    RaiseLastOSError;
+
+  Server := Copy(UrlComp.lpszHostName, 1, UrlComp.dwHostNameLength);
+  Resource := Copy(UrlComp.lpszUrlPath, 1, UrlComp.dwUrlPathLength);
+  Port := UrlComp.nPort;
+
+  { ---------------- Session ---------------- }
+  Session := WinHttpOpen('DelphiWinHTTP/1.0',
+    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    WINHTTP_NO_PROXY_NAME,
+    WINHTTP_NO_PROXY_BYPASS,
+    0);
+  if Session = nil then RaiseLastOSError;
+
+  Connect := WinHttpConnect(Session, PWideChar(Server), Port, 0);
+  if Connect = nil then RaiseLastOSError;
+
+  Flags := WINHTTP_FLAG_REFRESH;
+
+  Request := WinHttpOpenRequest(
+    Connect,
+    'POST',
+    PWideChar(Resource),
+    nil,
+    WINHTTP_NO_REFERER,
+    WINHTTP_DEFAULT_ACCEPT_TYPES,
+    Flags
+  );
+  if Request = nil then RaiseLastOSError;
+
+  { ---------------- Kerberos ---------------- }
+  WinHttpSetOption(Request, WINHTTP_OPTION_USE_DEFAULT_CREDENTIALS, nil, 0);
+
+  { ---------------- Формируем multipart header ---------------- }
+  Header :=
+    '--' + BOUNDARY + sLineBreak +
+    'Content-Disposition: form-data; name="pool_name"' + sLineBreak + sLineBreak +
+    PoolName + sLineBreak +
+
+    '--' + BOUNDARY + sLineBreak +
+    'Content-Disposition: form-data; name="expires_at"' + sLineBreak + sLineBreak +
+    ExpiresAt + sLineBreak +
+
+    '--' + BOUNDARY + sLineBreak +
+    'Content-Disposition: form-data; name="file_retention_period"' + sLineBreak + sLineBreak +
+    Retention.ToString + sLineBreak +
+
+    '--' + BOUNDARY + sLineBreak +
+    'Content-Disposition: form-data; name="files"; filename="' +
+    ExtractFileName(FilePath) + '"' + sLineBreak +
+    'Content-Type: application/octet-stream' + sLineBreak + sLineBreak;
+
+  Footer := sLineBreak + '--' + BOUNDARY + '--' + sLineBreak;
+
+  { ---------------- Открываем файл ---------------- }
+  FileStream := TFileStream.Create(FilePath, fmOpenRead or fmShareDenyWrite);
+  try
+    var ContentType := 'Content-Type: multipart/form-data; boundary=' + BOUNDARY;
+    WinHttpAddRequestHeaders(Request, PWideChar(ContentType),
+      Length(ContentType), WINHTTP_ADDREQ_FLAG_ADD);
+
+    if not WinHttpSendRequest(Request,
+      WINHTTP_NO_ADDITIONAL_HEADERS, 0, nil, 0, 0, 0) then
+      RaiseLastOSError;
+
+    { ---------------- Отправляем header ---------------- }
+    WinHttpWriteData(Request, PWideChar(Header), Length(Header), ReadBytes);
+
+    { ---------------- Отправляем файл chunk-ами ---------------- }
+    SentTotal := 0;
+
+    while True do
+    begin
+      ReadBytes := FileStream.Read(Buffer, SizeOf(Buffer));
+      if ReadBytes = 0 then Break;
+
+      WinHttpWriteData(Request, @Buffer[0], ReadBytes, ReadBytes);
+
+      SentTotal := SentTotal + ReadBytes;
+
+      if Assigned(Progress) then
+        Progress(SentTotal, FileStream.Size);
+    end;
+
+    { ---------------- Footer ---------------- }
+    WinHttpWriteData(Request, PWideChar(Footer), Length(Footer), ReadBytes);
+
+    { ---------------- Читаем ответ ---------------- }
+    WinHttpReceiveResponse(Request, nil);
+
+    Resp := TStringStream.Create;
+    try
+      repeat
+        WinHttpReadData(Request, @Buf[0], SizeOf(Buf), ReadBytes);
+        if ReadBytes > 0 then
+          Resp.Write(Buf[0], ReadBytes);
+      until ReadBytes = 0;
+
+      Result := Resp.DataString;
+    finally
+      Resp.Free;
+    end;
+
+  finally
+    FileStream.Free;
+    WinHttpCloseHandle(Request);
+    WinHttpCloseHandle(Connect);
+    WinHttpCloseHandle(Session);
+  end;
+end;
