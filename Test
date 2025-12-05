@@ -1,0 +1,432 @@
+unit fms;
+
+interface
+
+uses
+  System.SysUtils, System.Classes,
+  Winapi.Windows, Winapi.WinHTTP;
+
+type
+  TProgressCallback = reference to procedure(CurrentBytes, TotalBytes: Int64);
+
+  // =====================================================
+  // ===============      TFMSClient      ================
+  // =====================================================
+  TFMSClient = class
+  private
+    FBaseUrl: string;
+    FBearer: string;
+
+    function InternalGet(const Url: string): string;
+    function InternalDownload(const Url, SaveTo: string;
+                              OnProgress: TProgressCallback): Boolean;
+    function InternalUpload(const Url: string;
+                            const Files: TArray<string>;
+                            const PoolName, ExpiresAt: string;
+                            Retention: Integer;
+                            OnProgress: TProgressCallback): string;
+  public
+    constructor Create(const ABaseUrl, ABearerToken: string = '');
+
+    property BaseUrl: string read FBaseUrl write FBaseUrl;
+    property BearerToken: string read FBearer write FBearer;
+
+    // ---------------- API METHODS ----------------
+
+    function GetVersion: string;
+
+    function UploadFiles(
+      const Files: TArray<string>;
+      const PoolName: string;
+      const ExpiresAt: string;
+      Retention: Integer;
+      OnProgress: TProgressCallback = nil
+    ): string;
+
+    function DownloadFile(
+      const FileId: string;
+      const SaveTo: string;
+      OnProgress: TProgressCallback = nil
+    ): Boolean;
+  end;
+
+implementation
+
+const
+  BOUNDARY = '----MyBoundaryFMS123456789';
+
+function UTF8(const S: string): UTF8String;
+begin
+  Result := UTF8String(S);
+end;
+
+//
+// =======================================================
+// ===============   INTERNAL GET REQUEST   ==============
+// =======================================================
+//
+function TFMSClient.InternalGet(const Url: string): string;
+var
+  Session, Connect, Request: HINTERNET;
+  UrlComp: URL_COMPONENTS;
+  Host, Path: string;
+  Port: INTERNET_PORT;
+
+  Header: string;
+
+  Buffer: array[0..8191] of Byte;
+  BytesRead: DWORD;
+
+  Resp: TStringStream;
+
+begin
+  Result := '';
+
+  ZeroMemory(@UrlComp, SizeOf(UrlComp));
+  UrlComp.dwStructSize := SizeOf(UrlComp);
+  UrlComp.dwHostNameLength := DWORD(-1);
+  UrlComp.dwUrlPathLength := DWORD(-1);
+
+  if not WinHttpCrackUrl(PWideChar(Url), Length(Url), 0, UrlComp) then
+    raise Exception.Create('Invalid URL: ' + Url);
+
+  Host := UrlComp.lpszHostName;
+  Path := UrlComp.lpszUrlPath;
+  Port := UrlComp.nPort;
+
+  Session := WinHttpOpen('FMSClient/1.0',
+              WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+              WINHTTP_NO_PROXY_NAME,
+              WINHTTP_NO_PROXY_BYPASS, 0);
+  if Session = nil then RaiseLastOSError;
+
+  Connect := WinHttpConnect(Session, PWideChar(Host), Port, 0);
+  if Connect = nil then RaiseLastOSError;
+
+  Request := WinHttpOpenRequest(Connect, 'GET', PWideChar(Path), nil, nil, nil, 0);
+  if Request = nil then RaiseLastOSError;
+
+  Header := '';
+  if FBearer <> '' then
+    Header := 'Authorization: Bearer ' + FBearer + #13#10;
+
+  if not WinHttpSendRequest(Request, PWideChar(Header), Length(Header), nil, 0, 0, 0) then
+    RaiseLastOSError;
+
+  if not WinHttpReceiveResponse(Request, nil) then
+    RaiseLastOSError;
+
+  Resp := TStringStream.Create('', TEncoding.UTF8);
+  try
+    repeat
+      if not WinHttpReadData(Request, @Buffer, SizeOf(Buffer), BytesRead) then
+        RaiseLastOSError;
+
+      if BytesRead > 0 then
+        Resp.WriteBuffer(Buffer, BytesRead);
+
+    until BytesRead = 0;
+
+    Result := Resp.DataString;
+  finally
+    Resp.Free;
+    WinHttpCloseHandle(Request);
+    WinHttpCloseHandle(Connect);
+    WinHttpCloseHandle(Session);
+  end;
+end;
+
+
+//
+// =======================================================
+// ===============    INTERNAL DOWNLOAD     ==============
+// =======================================================
+//
+function TFMSClient.InternalDownload(
+  const Url, SaveTo: string;
+  OnProgress: TProgressCallback): Boolean;
+var
+  Session, Connect, Request: HINTERNET;
+  UrlComp: URL_COMPONENTS;
+
+  Host, Path: string;
+  Port: INTERNET_PORT;
+
+  FileStream: TFileStream;
+  Buffer: array[0..16383] of Byte;
+  BytesRead: DWORD;
+
+  Header: string;
+
+  TotalSize: Int64;
+  Index, Size: DWORD;
+
+begin
+  Result := False;
+  TotalSize := -1;
+
+  ZeroMemory(@UrlComp, SizeOf(UrlComp));
+  UrlComp.dwStructSize := SizeOf(UrlComp);
+  UrlComp.dwHostNameLength := DWORD(-1);
+  UrlComp.dwUrlPathLength := DWORD(-1);
+
+  if not WinHttpCrackUrl(PWideChar(Url), Length(Url), 0, UrlComp) then
+    raise Exception.Create('Invalid URL');
+
+  Host := UrlComp.lpszHostName;
+  Path := UrlComp.lpszUrlPath;
+  Port := UrlComp.nPort;
+
+  Session := WinHttpOpen('FMSDownloader/1.0',
+              WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+              WINHTTP_NO_PROXY_NAME,
+              WINHTTP_NO_PROXY_BYPASS, 0);
+  if Session = nil then RaiseLastOSError;
+
+  Connect := WinHttpConnect(Session, PWideChar(Host), Port, 0);
+  if Connect = nil then RaiseLastOSError;
+
+  Request := WinHttpOpenRequest(Connect, 'GET', PWideChar(Path), nil, nil, nil, 0);
+  if Request = nil then RaiseLastOSError;
+
+  Header := '';
+  if FBearer <> '' then
+    Header := 'Authorization: Bearer ' + FBearer + #13#10;
+
+  if not WinHttpSendRequest(Request, PWideChar(Header), Length(Header), nil, 0, 0, 0) then
+    RaiseLastOSError;
+
+  if not WinHttpReceiveResponse(Request, nil) then
+    RaiseLastOSError;
+
+  Index := 0;
+  Size := SizeOf(TotalSize);
+  WinHttpQueryHeaders(Request,
+                      WINHTTP_QUERY_CONTENT_LENGTH or WINHTTP_QUERY_FLAG_NUMBER,
+                      nil, @TotalSize, Size, Index);
+
+  FileStream := TFileStream.Create(SaveTo, fmCreate);
+  try
+    repeat
+      if not WinHttpReadData(Request, @Buffer, SizeOf(Buffer), BytesRead) then
+        RaiseLastOSError;
+
+      if BytesRead > 0 then
+      begin
+        FileStream.WriteBuffer(Buffer, BytesRead);
+
+        if Assigned(OnProgress) then
+          OnProgress(FileStream.Size, TotalSize);
+      end;
+
+    until BytesRead = 0;
+
+    Result := True;
+
+  finally
+    FileStream.Free;
+    WinHttpCloseHandle(Request);
+    WinHttpCloseHandle(Connect);
+    WinHttpCloseHandle(Session);
+  end;
+end;
+
+
+//
+// =======================================================
+// ===============    INTERNAL UPLOAD       ==============
+// =======================================================
+//
+function TFMSClient.InternalUpload(
+  const Url: string;
+  const Files: TArray<string>;
+  const PoolName, ExpiresAt: string;
+  Retention: Integer;
+  OnProgress: TProgressCallback
+): string;
+var
+  Session, Connect, Request: HINTERNET;
+  UrlComp: URL_COMPONENTS;
+
+  Host, Path: string;
+  Port: INTERNET_PORT;
+
+  Body: TMemoryStream;
+  fs: TFileStream;
+  Header: string;
+
+  Buffer: array[0..16383] of Byte;
+  ReadBytes: DWORD;
+
+  i: Integer;
+
+  Resp: TStringStream;
+
+begin
+  ZeroMemory(@UrlComp, SizeOf(UrlComp));
+  UrlComp.dwStructSize := SizeOf(UrlComp);
+  UrlComp.dwHostNameLength := DWORD(-1);
+  UrlComp.dwUrlPathLength := DWORD(-1);
+
+  if not WinHttpCrackUrl(PWideChar(Url), Length(Url), 0, UrlComp) then
+    raise Exception.Create('Invalid URL: ' + Url);
+
+  Host := UrlComp.lpszHostName;
+  Path := UrlComp.lpszUrlPath;
+  Port := UrlComp.nPort;
+
+  Session := WinHttpOpen('FMSUploader/1.0',
+              WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+              WINHTTP_NO_PROXY_NAME,
+              WINHTTP_NO_PROXY_BYPASS,
+              0);
+  if Session = nil then RaiseLastOSError;
+
+  Connect := WinHttpConnect(Session, PWideChar(Host), Port, 0);
+  if Connect = nil then RaiseLastOSError;
+
+  Request := WinHttpOpenRequest(Connect,
+              'POST',
+              PWideChar(Path),
+              nil, nil, nil,
+              WINHTTP_FLAG_REFRESH);
+  if Request = nil then RaiseLastOSError;
+
+  Body := TMemoryStream.Create;
+
+  try
+    // pool_name
+    Body.WriteBuffer(UTF8('--' + BOUNDARY + #13#10)[1], Length(UTF8('--' + BOUNDARY + #13#10)));
+    Body.WriteBuffer(UTF8('Content-Disposition: form-data; name="pool_name"'#13#10#13#10)[1],
+                     Length(UTF8('Content-Disposition: form-data; name="pool_name"'#13#10#13#10)));
+    Body.WriteBuffer(UTF8(PoolName + #13#10)[1], Length(UTF8(PoolName + #13#10)));
+
+    // expires_at
+    Body.WriteBuffer(UTF8('--' + BOUNDARY + #13#10)[1], Length(UTF8('--' + BOUNDARY + #13#10)));
+    Body.WriteBuffer(UTF8('Content-Disposition: form-data; name="expires_at"'#13#10#13#10)[1],
+                     Length(UTF8('Content-Disposition: form-data; name="expires_at"'#13#10#13#10)));
+    Body.WriteBuffer(UTF8(ExpiresAt + #13#10)[1], Length(UTF8(ExpiresAt + #13#10)));
+
+    // retention
+    Body.WriteBuffer(UTF8('--' + BOUNDARY + #13#10)[1], Length(UTF8('--' + BOUNDARY + #13#10)));
+    Body.WriteBuffer(UTF8('Content-Disposition: form-data; name="file_retention_period"'#13#10#13#10)[1],
+                     Length(UTF8('Content-Disposition: form-data; name="file_retention_period"'#13#10#13#10)));
+    Body.WriteBuffer(UTF8(IntToStr(Retention) + #13#10)[1], Length(UTF8(IntToStr(Retention) + #13#10)));
+
+    // files[]
+    for i := 0 to High(Files) do
+    begin
+      Body.WriteBuffer(UTF8('--' + BOUNDARY + #13#10)[1], Length(UTF8('--' + BOUNDARY + #13#10)));
+      Body.WriteBuffer(
+        UTF8(Format('Content-Disposition: form-data; name="files"; filename="%s"'#13#10,
+                    [ExtractFileName(Files[i])]))[1],
+        Length(UTF8(Format('Content-Disposition: form-data; name="files"; filename="%s"'#13#10,
+                           [ExtractFileName(Files[i])]))));
+
+      Body.WriteBuffer(UTF8('Content-Type: application/octet-stream'#13#10#13#10)[1],
+                       Length(UTF8('Content-Type: application/octet-stream'#13#10#13#10)));
+
+      fs := TFileStream.Create(Files[i], fmOpenRead or fmShareDenyWrite);
+      try
+        Body.CopyFrom(fs, fs.Size);
+      finally
+        fs.Free;
+      end;
+
+      Body.WriteBuffer(UTF8(#13#10)[1], 2);
+    end;
+
+    Body.WriteBuffer(UTF8('--' + BOUNDARY + '--'#13#10)[1],
+                     Length(UTF8('--' + BOUNDARY + '--'#13#10)));
+
+    // HEADERS
+    Header :=
+      'Content-Type: multipart/form-data; boundary=' + BOUNDARY + #13#10 +
+      'Content-Length: ' + IntToStr(Body.Size) + #13#10;
+
+    if FBearer <> '' then
+      Header := Header + 'Authorization: Bearer ' + FBearer + #13#10;
+
+    if not WinHttpSendRequest(Request,
+                              PWideChar(Header),
+                              Length(Header),
+                              Body.Memory,
+                              Body.Size,
+                              Body.Size, 0) then
+      RaiseLastOSError;
+
+    if Assigned(OnProgress) then
+      OnProgress(Body.Size, Body.Size);
+
+    if not WinHttpReceiveResponse(Request, nil) then
+      RaiseLastOSError;
+
+    Resp := TStringStream.Create('', TEncoding.UTF8);
+    try
+      repeat
+        if not WinHttpReadData(Request, @Buffer, SizeOf(Buffer), ReadBytes) then
+          RaiseLastOSError;
+        if ReadBytes > 0 then
+          Resp.WriteBuffer(Buffer, ReadBytes);
+      until ReadBytes = 0;
+
+      Result := Resp.DataString;
+    finally
+      Resp.Free;
+    end;
+
+  finally
+    Body.Free;
+    WinHttpCloseHandle(Request);
+    WinHttpCloseHandle(Connect);
+    WinHttpCloseHandle(Session);
+  end;
+end;
+
+
+//
+// =======================================================
+// ===============         PUBLIC API       ==============
+// =======================================================
+//
+
+// --- Constructor ---
+constructor TFMSClient.Create(const ABaseUrl, ABearerToken: string);
+begin
+  FBaseUrl := ABaseUrl.TrimRight(['/']);
+  FBearer := ABearerToken;
+end;
+
+// --- Получить версию API: GET /version ---
+function TFMSClient.GetVersion: string;
+begin
+  Result := InternalGet(FBaseUrl + '/version');
+end;
+
+// --- Upload multiple files ---
+function TFMSClient.UploadFiles(const Files: TArray<string>;
+  const PoolName, ExpiresAt: string; Retention: Integer;
+  OnProgress: TProgressCallback): string;
+begin
+  Result := InternalUpload(
+              FBaseUrl + '/files',
+              Files,
+              PoolName,
+              ExpiresAt,
+              Retention,
+              OnProgress
+            );
+end;
+
+// --- Download file by ID ---
+function TFMSClient.DownloadFile(const FileId, SaveTo: string;
+  OnProgress: TProgressCallback): Boolean;
+begin
+  Result := InternalDownload(
+              FBaseUrl + '/files/' + FileId,
+              SaveTo,
+              OnProgress
+            );
+end;
+
+end.
