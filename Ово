@@ -1,0 +1,204 @@
+unit fms_client;
+
+interface
+
+uses
+  System.SysUtils, System.Classes, System.Generics.Collections,
+  Curl.Easy, Curl.Lib, Curl.Form, Curl.Slist;
+
+type
+  TFMSClient = class
+  private
+    FBaseUrl: string;
+    FBearer: string;
+    FUseKerberos: Boolean;
+
+    class function WriteCallback(buffer: PAnsiChar; size, nmemb: size_t;
+      userdata: Pointer): size_t; static; cdecl;
+
+    class function ProgressCallback(clientp: Pointer; dltotal, dlnow,
+      ultotal, ulnow: curl_off_t): Integer; cdecl; static;
+
+  public
+    constructor Create(const ABaseUrl, ABearer: string; AUseKerberos: Boolean);
+
+    function GetVersion: string;
+    function UploadFiles(const Files: TArray<string>;
+      const PoolName, ExpiresAt: string;
+      AOnProgress: TProc<Int64, Int64> = nil): string;
+  end;
+
+implementation
+
+{ TFMSClient }
+
+constructor TFMSClient.Create(const ABaseUrl, ABearer: string; AUseKerberos: Boolean);
+begin
+  FBaseUrl := ABaseUrl;
+  FBearer := ABearer;
+  FUseKerberos := AUseKerberos;
+end;
+
+class function TFMSClient.WriteCallback(buffer: PAnsiChar; size, nmemb: size_t;
+  userdata: Pointer): size_t; cdecl;
+var
+  Stream: TStream;
+  Len: NativeInt;
+begin
+  Stream := TStream(userdata);
+  Len := size * nmemb;
+  Stream.Write(Buffer^, Len);
+  Result := Len;
+end;
+
+class function TFMSClient.ProgressCallback(clientp: Pointer; dltotal, dlnow,
+  ultotal, ulnow: curl_off_t): Integer; cdecl;
+var
+  Proc: TProc<Int64, Int64>;
+begin
+  Proc := TProc<Int64, Int64>(clientp);
+  if Assigned(Proc) then
+    Proc(ultotal, ulnow);
+
+  Result := 0; // continue
+end;
+
+function TFMSClient.GetVersion: string;
+var
+  Curl: PCURL;
+  Response: TMemoryStream;
+  URL: string;
+  HeaderList: pcurl_slist;
+begin
+  URL := FBaseUrl + '/version';
+  Response := TMemoryStream.Create;
+  HeaderList := nil;
+  Result := '';
+
+  Curl := curl_easy_init();
+  if Curl = nil then
+    Exit;
+
+  try
+    HeaderList := curl_slist_append(HeaderList, PAnsiChar('Accept: application/json'));
+
+    if FBearer <> '' then
+      HeaderList := curl_slist_append(HeaderList, PAnsiChar(AnsiString('Authorization: Bearer ' + FBearer)));
+
+    curl_easy_setopt(Curl, CURLOPT_URL, PAnsiChar(AnsiString(URL)));
+    curl_easy_setopt(Curl, CURLOPT_HTTPHEADER, HeaderList);
+    curl_easy_setopt(Curl, CURLOPT_WRITEFUNCTION, @TFMSClient.WriteCallback);
+    curl_easy_setopt(Curl, CURLOPT_WRITEDATA, Response);
+
+    if FUseKerberos then
+    begin
+      curl_easy_setopt(Curl, CURLOPT_HTTPAUTH, CURLAUTH_NEGOTIATE);
+    end;
+
+    if curl_easy_perform(Curl) = CURLE_OK then
+    begin
+      SetString(Result, PAnsiChar(Response.Memory), Response.Size);
+    end;
+
+  finally
+    if HeaderList <> nil then
+      curl_slist_free_all(HeaderList);
+
+    curl_easy_cleanup(Curl);
+    Response.Free;
+  end;
+end;
+
+function TFMSClient.UploadFiles(const Files: TArray<string>; const PoolName,
+  ExpiresAt: string; AOnProgress: TProc<Int64, Int64>): string;
+var
+  Curl: PCURL;
+  FormPost: PCurlForm;
+  LastForm: PCurlForm;
+  HeaderList: pcurl_slist;
+  Response: TMemoryStream;
+  URL: string;
+  FileName: string;
+  I: Integer;
+begin
+  Result := '';
+  URL := FBaseUrl + '/upload';
+
+  FormPost := nil;
+  LastForm := nil;
+  HeaderList := nil;
+
+  Response := TMemoryStream.Create;
+
+  Curl := curl_easy_init();
+  if Curl = nil then
+    Exit;
+
+  try
+    // поле PoolName
+    curl_formadd(@FormPost, @LastForm,
+      CURLFORM_COPYNAME, PAnsiChar('pool'),
+      CURLFORM_COPYCONTENTS, PAnsiChar(AnsiString(PoolName)),
+      CURLFORM_END);
+
+    // поле ExpiresAt
+    curl_formadd(@FormPost, @LastForm,
+      CURLFORM_COPYNAME, PAnsiChar('expiresAt'),
+      CURLFORM_COPYCONTENTS, PAnsiChar(AnsiString(ExpiresAt)),
+      CURLFORM_END);
+
+    // файлы
+    for I := 0 to High(Files) do
+    begin
+      FileName := ExtractFileName(Files[I]);
+
+      curl_formadd(@FormPost, @LastForm,
+        CURLFORM_COPYNAME, PAnsiChar('files'),
+        CURLFORM_FILE, PAnsiChar(AnsiString(Files[I])),
+        CURLFORM_FILENAME, PAnsiChar(AnsiString(FileName)),
+        CURLFORM_END);
+    end;
+
+    // заголовки
+    HeaderList := curl_slist_append(HeaderList, PAnsiChar('Accept: application/json'));
+
+    if FBearer <> '' then
+      HeaderList := curl_slist_append(HeaderList, PAnsiChar(AnsiString('Authorization: Bearer ' + FBearer)));
+
+    curl_easy_setopt(Curl, CURLOPT_URL, PAnsiChar(AnsiString(URL)));
+    curl_easy_setopt(Curl, CURLOPT_HTTPPOST, FormPost);
+    curl_easy_setopt(Curl, CURLOPT_HTTPHEADER, HeaderList);
+
+    // запись ответа
+    curl_easy_setopt(Curl, CURLOPT_WRITEFUNCTION, @TFMSClient.WriteCallback);
+    curl_easy_setopt(Curl, CURLOPT_WRITEDATA, Response);
+
+    // прогресс
+    if Assigned(AOnProgress) then
+    begin
+      curl_easy_setopt(Curl, CURLOPT_NOPROGRESS, 0);
+      curl_easy_setopt(Curl, CURLOPT_XFERINFOFUNCTION, @TFMSClient.ProgressCallback);
+      curl_easy_setopt(Curl, CURLOPT_XFERINFODATA, Pointer(AOnProgress));
+    end;
+
+    // Kerberos
+    if FUseKerberos then
+      curl_easy_setopt(Curl, CURLOPT_HTTPAUTH, CURLAUTH_NEGOTIATE);
+
+    if curl_easy_perform(Curl) = CURLE_OK then
+      SetString(Result, PAnsiChar(Response.Memory), Response.Size);
+
+  finally
+    Response.Free;
+
+    if HeaderList <> nil then
+      curl_slist_free_all(HeaderList);
+
+    if FormPost <> nil then
+      curl_formfree(FormPost);
+
+    curl_easy_cleanup(Curl);
+  end;
+end;
+
+end.
