@@ -1,0 +1,244 @@
+unit SevenZipHelper;
+
+interface
+
+uses
+  Windows, SysUtils, Classes;
+
+type
+  T7zProgressEvent = procedure(const Line: string) of object;
+
+  T7ZipResult = record
+    ExitCode: Cardinal;
+    Output: string;
+  end;
+
+  T7Zip = class
+  private
+    F7zPath: string;
+    FOnProgress: T7zProgressEvent;
+
+    function RunProcess(const Cmd: string): T7ZipResult;
+    procedure ParseProgress(const S: string);
+
+  public
+    constructor Create(const APathTo7z: string);
+
+    property OnProgress: T7zProgressEvent read FOnProgress write FOnProgress;
+
+    function AddFiles(const ArchiveName: string; const Files: array of string;
+      const Password: string = ''; CompressLevel: Integer = 5): T7ZipResult;
+
+    function Extract(const ArchiveName, OutputDir: string;
+      const Password: string = ''): T7ZipResult;
+
+    function TestArchive(const ArchiveName: string;
+      const Password: string = ''): T7ZipResult;
+
+    class function Find7zExecutable: string; static;
+  end;
+
+implementation
+
+{ ------------------------- Вспомогательные функции ------------------------- }
+
+function FileExistsInPath(const FileName: string): Boolean;
+var
+  PathVar: string;
+  List: TStringList;
+  i: Integer;
+begin
+  PathVar := GetEnvironmentVariable('PATH');
+  List := TStringList.Create;
+  try
+    List.StrictDelimiter := True;
+    List.Delimiter := ';';
+    List.DelimitedText := PathVar;
+
+    for i := 0 to List.Count - 1 do
+      if FileExists(List[i] + '\' + FileName) then
+        Exit(True);
+  finally
+    List.Free;
+  end;
+
+  Result := False;
+end;
+
+function ExpandEnv(const S: string): string;
+var
+  Buf: array[0..32767] of Char;
+begin
+  ExpandEnvironmentStrings(PChar(S), Buf, Length(Buf));
+  Result := Buf;
+end;
+
+{ ------------------------- Автопоиск 7z.exe ------------------------- }
+
+class function T7Zip.Find7zExecutable: string;
+const
+  Candidates: array[0..5] of string = (
+    '7z.exe',
+    '%PROGRAMFILES%\7-Zip\7z.exe',
+    '%PROGRAMFILES(X86)%\7-Zip\7z.exe',
+    '%LOCALAPPDATA%\Programs\7-Zip\7z.exe',
+    '%SYSTEMDRIVE%\7-Zip\7z.exe',
+    '%SYSTEMROOT%\7z.exe'
+  );
+var
+  PathNear: string;
+  Full: string;
+  i: Integer;
+begin
+  // рядом с EXE программы
+  PathNear := ExtractFilePath(ParamStr(0)) + '7z.exe';
+  if FileExists(PathNear) then
+    Exit(PathNear);
+
+  // в PATH
+  if FileExistsInPath('7z.exe') then
+    Exit('7z.exe');
+
+  // в стандартных каталогах
+  for i := 0 to High(Candidates) do
+  begin
+    Full := ExpandEnv(Candidates[i]);
+    if FileExists(Full) then
+      Exit(Full);
+  end;
+
+  Result := '';
+end;
+
+{ ------------------------- Реализация T7Zip ------------------------- }
+
+constructor T7Zip.Create(const APathTo7z: string);
+begin
+  F7zPath := APathTo7z;
+end;
+
+procedure T7Zip.ParseProgress(const S: string);
+begin
+  if Assigned(FOnProgress) then
+    FOnProgress(S);
+end;
+
+function T7Zip.RunProcess(const Cmd: string): T7ZipResult;
+var
+  SA: TSecurityAttributes;
+  SI: TStartupInfo;
+  PI: TProcessInformation;
+  PipeRead, PipeWrite: THandle;
+  Buffer: array[0..2047] of AnsiChar;
+  BytesRead: Cardinal;
+  OutStr: AnsiString;
+  Line: string;
+  i: Integer;
+begin
+  Result.Output := '';
+  Result.ExitCode := DWORD(-1);
+
+  ZeroMemory(@SA, SizeOf(SA));
+  SA.nLength := SizeOf(SA);
+  SA.bInheritHandle := True;
+
+  CreatePipe(PipeRead, PipeWrite, @SA, 0);
+  SetHandleInformation(PipeRead, HANDLE_FLAG_INHERIT, 0);
+
+  ZeroMemory(@SI, SizeOf(SI));
+  SI.cb := SizeOf(SI);
+  SI.dwFlags := STARTF_USESTDHANDLES;
+  SI.hStdOutput := PipeWrite;
+  SI.hStdError := PipeWrite;
+
+  if not CreateProcess(nil, PChar(Cmd), nil, nil, True,
+                       NORMAL_PRIORITY_CLASS, nil, nil, SI, PI) then
+    Exit;
+
+  CloseHandle(PipeWrite);
+  Line := '';
+
+  while True do
+  begin
+    if not ReadFile(PipeRead, Buffer, SizeOf(Buffer), BytesRead, nil) then
+      Break;
+    if BytesRead = 0 then
+      Break;
+
+    SetString(OutStr, Buffer, BytesRead);
+    Result.Output := Result.Output + string(OutStr);
+
+    for i := 1 to Length(string(OutStr)) do
+    begin
+      if OutStr[i] in [#10, #13] then
+      begin
+        if Line <> '' then
+        begin
+          ParseProgress(Line);
+          Line := '';
+        end;
+      end
+      else
+        Line := Line + OutStr[i];
+    end;
+  end;
+
+  WaitForSingleObject(PI.hProcess, INFINITE);
+  GetExitCodeProcess(PI.hProcess, Result.ExitCode);
+
+  CloseHandle(PipeRead);
+  CloseHandle(PI.hProcess);
+  CloseHandle(PI.hThread);
+end;
+
+{ ------------------------- Упаковка ------------------------- }
+
+function T7Zip.AddFiles(const ArchiveName: string; const Files: array of string;
+  const Password: string; CompressLevel: Integer): T7ZipResult;
+var
+  Cmd, List: string;
+  i: Integer;
+begin
+  List := '';
+  for i := 0 to High(Files) do
+    List := List + '"' + Files[i] + '" ';
+
+  Cmd := Format('"%s" a "%s" %s -mx=%d ',
+                [F7zPath, ArchiveName, List, CompressLevel]);
+
+  if Password <> '' then
+    Cmd := Cmd + Format('-p"%s" -mhe=on ', [Password]);
+
+  Result := RunProcess(Cmd);
+end;
+
+{ ------------------------- Распаковка ------------------------- }
+
+function T7Zip.Extract(const ArchiveName, OutputDir, Password: string): T7ZipResult;
+var
+  Cmd: string;
+begin
+  Cmd := Format('"%s" x "%s" -o"%s" -y ',
+                [F7zPath, ArchiveName, OutputDir]);
+
+  if Password <> '' then
+    Cmd := Cmd + Format('-p"%s" ', [Password]);
+
+  Result := RunProcess(Cmd);
+end;
+
+{ ------------------------- Проверка ------------------------- }
+
+function T7Zip.TestArchive(const ArchiveName: string; const Password: string): T7ZipResult;
+var
+  Cmd: string;
+begin
+  Cmd := Format('"%s" t "%s" ', [F7zPath, ArchiveName]);
+
+  if Password <> '' then
+    Cmd := Cmd + Format('-p"%s" ', [Password]);
+
+  Result := RunProcess(Cmd);
+end;
+
+end.
