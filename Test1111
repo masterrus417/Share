@@ -1,0 +1,75 @@
+function T7Zip.RunProcess(const Cmd: string): T7ZipResult;
+var
+  SA: TSecurityAttributes;
+  SI: TStartupInfo;
+  PI: TProcessInformation;
+  StdOutRead, StdOutWrite: THandle;
+  Buffer: array[0..4095] of AnsiChar;
+  BytesRead: DWORD;
+  Line: string;
+  OutStr: AnsiString;
+begin
+  Result.Output := '';
+  Result.ExitCode := DWORD(-1);
+
+  // security
+  ZeroMemory(@SA, SizeOf(SA));
+  SA.nLength := SizeOf(SA);
+  SA.bInheritHandle := True;
+  SA.lpSecurityDescriptor := nil;
+
+  // pipe
+  if not CreatePipe(StdOutRead, StdOutWrite, @SA, 0) then Exit;
+  SetHandleInformation(StdOutRead, HANDLE_FLAG_INHERIT, 0);
+
+  // startup info
+  ZeroMemory(@SI, SizeOf(SI));
+  SI.cb := SizeOf(SI);
+  SI.dwFlags := STARTF_USESTDHANDLES or STARTF_USESHOWWINDOW;
+  SI.wShowWindow := SW_HIDE;
+  SI.hStdOutput := StdOutWrite;
+  SI.hStdError := StdOutWrite;
+
+  ZeroMemory(@PI, SizeOf(PI));
+
+  if not CreateProcess(
+       nil,
+       PChar(Cmd),
+       nil, nil,
+       True,
+       CREATE_NO_WINDOW,
+       nil,
+       nil,
+       SI,
+       PI
+     ) then
+  begin
+    CloseHandle(StdOutWrite);
+    CloseHandle(StdOutRead);
+    Exit;
+  end;
+
+  CloseHandle(StdOutWrite);
+
+  Line := '';
+
+  while True do
+  begin
+    if not ReadFile(StdOutRead, Buffer, SizeOf(Buffer), BytesRead, nil) then Break;
+    if BytesRead = 0 then Break;
+
+    SetString(OutStr, Buffer, BytesRead);
+    Result.Output := Result.Output + string(OutStr);
+
+    // progress parse
+    if Assigned(FOnProgress) then
+      FOnProgress(string(OutStr));
+  end;
+
+  WaitForSingleObject(PI.hProcess, INFINITE);
+  GetExitCodeProcess(PI.hProcess, Result.ExitCode);
+
+  CloseHandle(StdOutRead);
+  CloseHandle(PI.hProcess);
+  CloseHandle(PI.hThread);
+end;
