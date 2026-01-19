@@ -1,0 +1,89 @@
+from datetime import datetime, timedelta, time
+
+def calculate_finish_date(
+    start_dt: datetime, 
+    hours_to_work: float, 
+    work_start: time, 
+    work_end: time, 
+    lunch_start: time, 
+    lunch_end: time
+) -> datetime:
+    """
+    Расчет даты и времени окончания этапа с учетом рабочего графика.
+    """
+    # 1. Подготовка календаря (за текущий и следующий год)
+    start_year = start_dt.year
+    next_year = start_year + 1
+    
+    # Предполагается, что RefWorkCalendar — это модель Django
+    qs = RefWorkCalendar.objects.filter(
+        Q(rwc_date__year=start_year) | Q(rwc_date__year=next_year)
+    )
+    
+    calendar = {}
+    for item in qs:
+        if item.rwc_sing is True:
+            calendar[item.rwc_date] = 'holiday'
+        elif item.rwc_sing is False:
+            calendar[item.rwc_date] = 'shortened'
+        else:
+            calendar[item.rwc_date] = 'normal'
+
+    current = start_dt
+    remaining_hours = hours_to_work
+
+    # Основной цикл распределения трудозатрат
+    while remaining_hours > 0.000001:  # Защита от микро-погрешностей float
+        day = current.date()
+        status = calendar.get(day)
+        
+        # Пропуск выходных и праздников
+        is_weekend = day.weekday() >= 5 and status is None
+        if is_weekend or status == 'holiday':
+            current = datetime.combine(day + timedelta(days=1), work_start)
+            continue
+
+        # Определяем границы рабочего дня
+        d_start = datetime.combine(day, work_start)
+        d_end = datetime.combine(day, work_end)
+        
+        # Учет сокращенного дня
+        if status == 'shortened':
+            d_end -= timedelta(hours=1)
+            
+        l_start = datetime.combine(day, lunch_start)
+        l_end = datetime.combine(day, lunch_end)
+        lunch_duration_td = l_end - l_start
+        lunch_duration_hours = lunch_duration_td.total_seconds() / 3600
+
+        # Корректируем точку старта, если она вне рабочего времени
+        if current < d_start:
+            current = d_start
+        if l_start <= current < l_end:
+            current = l_end
+        if current >= d_end:
+            current = datetime.combine(day + timedelta(days=1), work_start)
+            continue
+
+        # Считаем, сколько ЧИСТЫХ рабочих часов осталось в этом дне
+        total_time_until_end = (d_end - current).total_seconds() / 3600
+        
+        # Если мы еще не обедали, вычитаем обед из доступного времени дня
+        if current < l_start:
+            available_today = total_time_until_end - lunch_duration_hours
+        else:
+            available_today = total_time_until_end
+
+        # Проверка: заканчиваем ли сегодня?
+        if remaining_hours <= available_today:
+            finish = current + timedelta(hours=remaining_hours)
+            # Если в процессе работы наступил обед — сдвигаем финиш вперед
+            if current < l_start and finish > l_start:
+                finish += lunch_duration_td
+            return finish
+        else:
+            # Переносим остаток на следующий день
+            remaining_hours -= available_today
+            current = datetime.combine(day + timedelta(days=1), work_start)
+
+    return current
